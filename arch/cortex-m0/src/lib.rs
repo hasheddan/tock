@@ -2,7 +2,7 @@
 
 #![crate_name = "cortexm0"]
 #![crate_type = "rlib"]
-#![feature(llvm_asm, naked_functions)]
+#![feature(asm, naked_functions)]
 #![no_std]
 
 // Re-export the base generic cortex-m functions here as they are
@@ -35,7 +35,7 @@ pub unsafe extern "C" fn generic_isr() {
 #[naked]
 /// All ISRs are caught by this handler which disables the NVIC and switches to the kernel.
 pub unsafe extern "C" fn generic_isr() {
-    llvm_asm!(
+    asm!(
         "
     /* Skip saving process state if not coming from user-space */
     ldr r0, MEXC_RETURN_PSP
@@ -111,7 +111,7 @@ MEXC_RETURN_MSP:
   .word 0xFFFFFFF9
 MEXC_RETURN_PSP:
   .word 0xFFFFFFFD"
-    : : : : "volatile");
+    );
 }
 
 // Mock implementation for tests on Travis-CI.
@@ -123,7 +123,7 @@ pub unsafe extern "C" fn svc_handler() {
 #[cfg(all(target_arch = "arm", target_os = "none"))]
 #[naked]
 pub unsafe extern "C" fn svc_handler() {
-    llvm_asm!(
+    asm!(
         "
   ldr r0, EXC_RETURN_MSP
   cmp lr, r0
@@ -144,7 +144,7 @@ EXC_RETURN_MSP:
 EXC_RETURN_PSP:
   .word 0xFFFFFFFD
   "
-  : : : : "volatile"  );
+    );
 }
 
 // Mock implementation for tests on Travis-CI.
@@ -162,47 +162,56 @@ pub unsafe extern "C" fn switch_to_user(
     mut user_stack: *const u8,
     process_regs: &mut [usize; 8],
 ) -> *mut u8 {
-    llvm_asm!("
+    asm!("
+    // Manually save r6 in r3 since as of Feb 2021 asm!() will not let us mark
+    // r6 as a clobber.
+    mov r3, r6
+
     /* Load non-hardware-stacked registers from Process stack */
-    ldmia $2!, {r4-r7}
+    ldmia r1!, {r4-r7}
     mov r11, r7
     mov r10, r6
     mov r9,  r5
     mov r8,  r4
-    ldmia $2!, {r4-r7}
-    subs $2, 32 /* Restore pointer to process_regs
+    ldmia r1!, {r4-r7}
+    subs r1, 32 /* Restore pointer to process_regs
                 /* ldmia! added a 32-byte offset */
 
     /* Load bottom of stack into Process Stack Pointer */
-    msr psp, $0
+    msr psp, r0
 
     /* SWITCH */
     svc 0xff /* It doesn't matter which SVC number we use here */
 
     /* Store non-hardware-stacked registers in process_regs */
-    /* $2 still points to process_regs because we are clobbering all */
+    /* r1 still points to process_regs because we are clobbering all */
     /* non-hardware-stacked registers */
-    str r4, [$2, #16]
-    str r5, [$2, #20]
-    str r6, [$2, #24]
-    str r7, [$2, #28]
+    str r4, [r1, #16]
+    str r5, [r1, #20]
+    str r6, [r1, #24]
+    str r7, [r1, #28]
 
     mov  r4, r8
     mov  r5, r9
     mov  r6, r10
     mov  r7, r11
 
-    str r4, [$2, #0]
-    str r5, [$2, #4]
-    str r6, [$2, #8]
-    str r7, [$2, #12]
+    str r4, [r1, #0]
+    str r5, [r1, #4]
+    str r6, [r1, #8]
+    str r7, [r1, #12]
 
-    mrs $0, PSP /* PSP into user_stack */
+    mrs r0, PSP /* PSP into user_stack */
 
-    "
-    : "={r0}"(user_stack)
-    : "{r0}"(user_stack), "{r1}"(process_regs)
-    : "r4","r5","r6","r8","r9","r10","r11" : "volatile" );
+    // Manually restore r6.
+    mov r6, r3
+
+    ",
+    inout("r0") user_stack,
+    in("r1") process_regs,
+    out("r3") _, out("r4") _, out("r5") _, out("r8") _, out("r9") _,
+    out("r10") _, out("r11") _);
+
     user_stack as *mut u8
 }
 
@@ -237,15 +246,13 @@ unsafe fn kernel_hardfault(faulting_stack: *mut u32) {
     //       value. Therefore as a workaround, capture the stacked
     //       registers and invoke a breakpoint.
     //
-    llvm_asm!("
+    asm!(
+        "
          bkpt
 1:
          b 1b
          "
-         :
-         : "r"(&hardfault_stacked_registers)
-         :
-         : "volatile");
+    );
 }
 
 // Mock implementation for tests on Travis-CI.
@@ -261,8 +268,8 @@ pub unsafe extern "C" fn hard_fault_handler() {
     let kernel_stack: bool;
 
     // If `kernel_stack` is non-zero, then hard-fault occurred in
-    // kernel, otherwise the hard-fault occurrend in user.
-    llvm_asm!("
+    // kernel, otherwise the hard-fault occurred in user.
+    asm!("
     /*
      * Will be incremented to 1 when we determine that it was a fault
      * in the kernel
@@ -286,19 +293,16 @@ _hardfault_msp:
     adds r1, #1
 
 _hardfault_exit:
-    "
-    : "={r0}"(faulting_stack), "={r1}"(kernel_stack)
-    :
-    : "r0", "r1", "r2", "r3"
-    : "volatile"
-    );
+    ",
+    out("r0") faulting_stack, out("r1") kernel_stack,
+    out("r2") _, out("r3") _);
 
     if kernel_stack {
         kernel_hardfault(faulting_stack);
     } else {
         // hard fault occurred in an app, not the kernel. The app should be
         // marked as in an error state and handled by the kernel
-        llvm_asm!("
+        asm!("
              ldr r0, =APP_HARD_FAULT
              movs r1, #1 /* Fault */
              str r1, [r0, #0]
@@ -340,10 +344,6 @@ _hardfault_exit:
 .align 4
 FEXC_RETURN_MSP:
   .word 0xFFFFFFF9
-             "
-             :
-             :
-             :
-             : "volatile");
+             ");
     }
 }
