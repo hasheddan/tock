@@ -39,21 +39,27 @@ struct IPCData<const NUM_PROCS: usize> {
 }
 
 impl<const NUM_PROCS: usize> GrantDefault for IPCData<NUM_PROCS> {
-    fn grant_default(
-        _process_id: AppId,
-        _cb_factory: &mut ProcessCallbackFactory,
-    ) -> IPCData<NUM_PROCS> {
-        // TODO: This breaks with the Callback swapping prevention mechanisms
-        unimplemented!();
-
+    fn grant_default(_process_id: AppId, cb_factory: &mut ProcessCallbackFactory) -> Self {
         const DEFAULT_RW_APP_SLICE: ReadWriteAppSlice = ReadWriteAppSlice::const_default();
-        const DEFAULT_CALLBACK: Callback = Callback::const_default();
+        unsafe {
+            use core::mem::MaybeUninit;
+            // need this unless we use a macro to initialize the variable length
+            // array because each initial value is different.
+            let mut array_hack: MaybeUninit<[Callback; NUM_PROCS]> = MaybeUninit::uninit();
 
-        IPCData {
-            shared_memory: [DEFAULT_RW_APP_SLICE; NUM_PROCS],
-            search_slice: ReadOnlyAppSlice::default(),
-            client_callbacks: [DEFAULT_CALLBACK; NUM_PROCS],
-            callback: Callback::default(),
+            let service_cb = cb_factory.build_callback(0).unwrap();
+            let mut ptr_i = array_hack.as_mut_ptr() as *mut Callback;
+            for i in 0..NUM_PROCS {
+                ptr_i.write(cb_factory.build_callback(i as u32 + 1).unwrap());
+                ptr_i = ptr_i.add(1);
+            }
+
+            Self {
+                shared_memory: [DEFAULT_RW_APP_SLICE; NUM_PROCS],
+                search_slice: ReadOnlyAppSlice::default(),
+                client_callbacks: array_hack.assume_init(),
+                callback: service_cb,
+            }
         }
     }
 }
@@ -89,11 +95,8 @@ impl<const NUM_PROCS: usize> IPC<NUM_PROCS> {
                     match cb_type {
                         IPCCallbackType::Service => f(&mut mydata.callback),
                         IPCCallbackType::Client => match called_from.index() {
-                            Some(i) => f(mydata
-                                .client_callbacks
-                                .get_mut(i)
-                                .unwrap_or(&mut Callback::default())),
-                            None => f(&mut Callback::default()),
+                            Some(i) => f(mydata.client_callbacks.get_mut(i).unwrap()),
+                            None => panic!("Invalid app issued IPC request"), //TODO: return Error instead
                         },
                     };
                 };
